@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+import sys, re, subprocess, tempfile, os
+
+def clean_and_flatten(file_path):
+    try:
+        with open(file_path, 'r') as f:
+            content = f.read()
+    except FileNotFoundError:
+        return f"Error: {file_path} not found."
+
+    # 1. Strip comments
+    content = re.sub(r'#.*', '', content)
+    content = re.sub(r'/\*.*?\*/', '', content, flags=re.DOTALL)
+
+    # 2. Extract assignments
+    final_assignments = {}
+    path_stack = []
+
+    # PROTECT STRINGS: This regex finds multi-line strings, double-quoted strings,
+    # and Nix delimiters/tokens without breaking strings apart.
+    token_pattern = r"''[\s\S]*?''|\".*?\"|[={};\[\]]|\bwith\s+pkgs;|[^\s={};\[\]]+"
+    tokens = re.findall(token_pattern, content)
+
+    current_key = None
+    buffer = []
+    list_depth = 0
+    with_prefix = ""
+
+    for t in tokens:
+        if t == '=' and list_depth == 0:
+            if buffer: current_key = buffer[-1]
+            buffer = []
+        elif t == '{' and list_depth == 0:
+            if current_key:
+                path_stack.append(current_key)
+                current_key = None
+            buffer = []
+        elif t == '}' and list_depth == 0:
+            if path_stack: path_stack.pop()
+            buffer = []
+        elif t == '[':
+            list_depth += 1
+            buffer.append(t)
+        elif t == ']':
+            list_depth -= 1
+            buffer.append(t)
+        elif t == 'with pkgs;':
+            with_prefix = "with pkgs; "
+        elif t == ';' and list_depth == 0:
+            if current_key:
+                val = " ".join(buffer).strip()
+                full_path = ".".join(path_stack + [current_key])
+                final_assignments[full_path] = f"{with_prefix}{val}"
+                current_key = None
+                with_prefix = ""
+            buffer = []
+        else:
+            buffer.append(t)
+
+    # 3. Construct Output
+    output = ["{ config, pkgs, lib, ... }:", "{"]
+    for key in sorted(final_assignments.keys()):
+        if key in ["config", "pkgs", "lib", "...", "imports"]: continue
+        val = final_assignments[key]
+        if val: output.append(f"  {key} = {val};")
+
+    if "imports" in final_assignments:
+        output.append(f"  imports = {final_assignments['imports']};")
+
+    output.append("}")
+    final_nix_code = "\n".join(output)
+
+    # 4. Final Validation
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.nix', delete=False) as tmp:
+        tmp_name = tmp.name
+        tmp.write(final_nix_code)
+
+    try:
+        result = subprocess.run(['nix-instantiate', '--parse', tmp_name], capture_output=True, text=True)
+        if result.returncode == 0:
+            print(final_nix_code)
+        else:
+            print("--- VALIDATION FAILED ---", file=sys.stderr)
+            print(result.stderr, file=sys.stderr)
+            lines = final_nix_code.splitlines()
+            for i, l in enumerate(lines):
+                print(f"{i+1:3}: {l}", file=sys.stderr)
+            sys.exit(1)
+    finally:
+        if os.path.exists(tmp_name): os.remove(tmp_name)
+
+if __name__ == "__main__":
+    path = sys.argv if len(sys.argv) > 1 else "/etc/nixos/configuration.nix"
+    clean_and_flatten(path)
